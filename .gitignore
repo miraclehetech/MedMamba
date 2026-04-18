@@ -1,0 +1,4 @@
+# 忽略一切，只白名单 model.py 和本文件
+*
+!.gitignore
+!model.py
