@@ -8,14 +8,14 @@ from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
 
 
 # ──────────────────────────────────────────────────────────────
-#  批量化 SSM 核心层
+#  Batched SSM core layer
 # ──────────────────────────────────────────────────────────────
 
 class BatchedMambaCore(nn.Module):
-    """批量化多方向 Mamba: 将 K 组扫描方向打包为一次 selective_scan 调用。
+    """Batched multi-direction Mamba: packs K scan directions into a single selective_scan call.
 
-    K=2: 双向 (forward + backward)
-    K=4: 四向 (forward + backward + even-odd + odd-even)
+    K=2: bidirectional (forward + backward)
+    K=4: four directions (forward + backward + even-odd + odd-even)
     """
 
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2, K=4,
@@ -30,7 +30,7 @@ class BatchedMambaCore(nn.Module):
         self.capture_states = False
         self._cached_states = None
 
-        # ── 共享参数 ──
+        # ── Shared parameters ──
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(
             self.d_inner, self.d_inner,
@@ -42,19 +42,19 @@ class BatchedMambaCore(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
         self.dropout = nn.Dropout(dropout)
 
-        # ── 按方向参数 (K 组，合并存储) ──
-        # x_proj: 从 d_inner 投影到 (dt_rank + 2*d_state)，每个方向独立
+        # ── Per-direction parameters (K groups, stored together) ──
+        # x_proj: projects d_inner to (dt_rank + 2*d_state), independent per direction
         self.x_proj_weight = nn.Parameter(
             torch.randn(K, self.dt_rank + d_state * 2, self.d_inner)
             * (self.d_inner ** -0.5)
         )
 
-        # dt_proj: 从 dt_rank 投影到 d_inner，每个方向独立
+        # dt_proj: projects dt_rank to d_inner, independent per direction
         dt_init_std = self.dt_rank ** -0.5
         self.dt_projs_weight = nn.Parameter(
             torch.empty(K, self.d_inner, self.dt_rank).uniform_(-dt_init_std, dt_init_std)
         )
-        # dt bias: 初始化使 softplus(bias) 在 [dt_min, dt_max] 范围
+        # dt bias: initialized so softplus(bias) falls in [dt_min, dt_max]
         dt = torch.exp(
             torch.rand(K, self.d_inner) * (math.log(0.1) - math.log(0.001))
             + math.log(0.001)
@@ -62,7 +62,7 @@ class BatchedMambaCore(nn.Module):
         inv_dt = dt + torch.log(-torch.expm1(-dt))
         self.dt_projs_bias = nn.Parameter(inv_dt)
 
-        # A: S4D 初始化，存储 log 形式
+        # A: S4D initialization, stored in log form
         A = repeat(
             torch.arange(1, d_state + 1, dtype=torch.float32),
             "n -> d n", d=self.d_inner,
@@ -79,7 +79,7 @@ class BatchedMambaCore(nn.Module):
         )  # (K*d_inner,)
         self.Ds._no_weight_decay = True
 
-        # ── 偶奇/奇偶排列索引 (K=4 时使用) ──
+        # ── Even-odd / odd-even permutation indices (used when K=4) ──
         if K == 4 and seq_len is not None:
             eo_perm, eo_inv = self._build_interleave_indices(seq_len, even_first=True)
             oe_perm, oe_inv = self._build_interleave_indices(seq_len, even_first=False)
@@ -88,7 +88,7 @@ class BatchedMambaCore(nn.Module):
             self.register_buffer('oe_perm', oe_perm)
             self.register_buffer('oe_inv', oe_inv)
 
-        # ── concat 模式的投影层 ──
+        # ── Projection layer for concat mode ──
         if merge_mode == "concat":
             self.merge_proj = nn.Linear(self.d_inner * K, self.d_inner, bias=False)
 
@@ -104,7 +104,7 @@ class BatchedMambaCore(nn.Module):
         return torch.tensor(perm, dtype=torch.long), torch.tensor(inv_perm, dtype=torch.long)
 
     def _cross_scan(self, x):
-        """将输入按 K 个方向展开为 1D 序列。
+        """Expand input into K 1D sequences along different directions.
         x: (B, D, L) → xs: (B, K, D, L)
         """
         B, D, L = x.shape
@@ -123,12 +123,12 @@ class BatchedMambaCore(nn.Module):
         return xs
 
     def _cross_merge(self, ys):
-        """将 K 组扫描结果合并回原始顺序。
+        """Merge K scan results back to the original order.
         ys: (B, K, D, L) → y: (B, D, L)
         """
-        # 先对齐各方向回原始顺序
+        # Align each direction back to the original order
         if self.K == 1:
-            return ys[:, 0]                          # (B, D, L) 直接返回
+            return ys[:, 0]                          # (B, D, L) returned as-is
         elif self.K == 2:
             aligned = [ys[:, 0], ys[:, 1].flip(-1)]
         else:  # K == 4
@@ -150,12 +150,12 @@ class BatchedMambaCore(nn.Module):
 
     @torch.no_grad()
     def _compute_ssm_states(self, u, delta, A, B, C, delta_bias):
-        """用纯 Python 参考实现计算 SSM 中间状态，仅在可视化时调用。
+        """Reference pure-Python implementation to compute intermediate SSM states, used for visualization only.
 
         Returns dict with:
-            delta: (B, K*d_inner, L) — softplus 后的时间步
-            hidden_states: (B, K*d_inner, N, L) — 每步隐藏状态
-            B: (B, K, N, L), C: (B, K, N, L) — 输入/输出调制矩阵
+            delta: (B, K*d_inner, L) — time steps after softplus
+            hidden_states: (B, K*d_inner, N, L) — hidden state at each step
+            B: (B, K, N, L), C: (B, K, N, L) — input/output modulation matrices
         """
         u = u.float()
         delta = delta.float()
@@ -166,7 +166,7 @@ class BatchedMambaCore(nn.Module):
         batch, dim, dstate = u.shape[0], A.shape[0], A.shape[1]
         deltaA = torch.exp(torch.einsum('bdl,dn->bdln', delta, A))
 
-        # B 是 4D: (B, K, N, L)，需要展开到 (B, K*d_inner, N, L)
+        # B is 4D: (B, K, N, L); expand to (B, K*d_inner, N, L)
         B_exp = B.float()
         B_exp = B_exp.repeat_interleave(self.d_inner, dim=1)  # (B, K*d_inner, N, L)
         deltaB_u = torch.einsum('bdl,bdnl,bdl->bdln', delta, B_exp, u)
@@ -188,19 +188,19 @@ class BatchedMambaCore(nn.Module):
         # x: (B, L, D)  D=d_model
         B, L, D = x.shape
 
-        # ── 输入投影 + 门控分离 ──
+        # ── Input projection + gate split ──
         xz = self.in_proj(x)                               # (B, L, 2*d_inner)
-        x_ssm, z = xz.chunk(2, dim=-1)                     # 各 (B, L, d_inner)
-        z = self.act(z)                                     # SiLU 门控
+        x_ssm, z = xz.chunk(2, dim=-1)                     # each (B, L, d_inner)
+        z = self.act(z)                                     # SiLU gate
 
-        # ── DWConv 局部特征提取 ──
+        # ── DWConv local feature extraction ──
         x_ssm = x_ssm.transpose(1, 2)                      # (B, d_inner, L)
         x_ssm = self.act(self.conv1d(x_ssm))                  # DWConv + SiLU
 
-        # ── CrossScan: 展开 K 组方向 ──
+        # ── CrossScan: expand into K directions ──
         xs = self._cross_scan(x_ssm)                        # (B, K, d_inner, L)
 
-        # ── 投影得到 SSM 参数 dt, B, C (每方向独立) ──
+        # ── Project to SSM parameters dt, B, C (independent per direction) ──
         K = self.K
         R, N = self.dt_rank, self.d_state
 
@@ -214,7 +214,7 @@ class BatchedMambaCore(nn.Module):
             "b k r l, k d r -> b k d l", dts, self.dt_projs_weight
         )                                                    # (B, K, d_inner, L)
 
-        # ── 拉平 K 到 D 维度，单次 selective_scan ──
+        # ── Flatten K into D dimension, single selective_scan call ──
         xs_flat = xs.contiguous().view(B, -1, L)             # (B, K*d_inner, L)
         dts_flat = dts.contiguous().view(B, -1, L)           # (B, K*d_inner, L)
         As = -torch.exp(self.A_logs.float())                 # (K*d_inner, N)
@@ -233,14 +233,14 @@ class BatchedMambaCore(nn.Module):
             self._cached_states = self._compute_ssm_states(
                 xs_flat, dts_flat, As, Bs, Cs, delta_bias)
 
-        # ── CrossMerge: 合并 K 组结果 ──
+        # ── CrossMerge: merge K scan results ──
         ys = ys.view(B, K, self.d_inner, L)
         y = self._cross_merge(ys)                            # (B, d_inner, L)
 
-        # ── 输出归一化 + 门控 + 投影 ──
+        # ── Output normalization + gating + projection ──
         y = y.transpose(1, 2)                                # (B, L, d_inner)
         y = self.out_norm(y)
-        y = y * z                                            # 门控
+        y = y * z                                            # gate
         out = self.dropout(self.out_proj(y))                 # (B, L, d_model)
         return out
 
@@ -248,7 +248,7 @@ class BatchedMambaCore(nn.Module):
 
 
 class ChannelDropout(nn.Module):
-    """训练时随机 drop 整个输入通道，迫使模型不依赖单一通道。"""
+    """During training, randomly drop entire input channels to prevent the model from relying on any single channel."""
     def __init__(self, p=0.1):
         super().__init__()
         self.p = p
@@ -262,11 +262,11 @@ class ChannelDropout(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
-#  基础组件
+#  Basic components
 # ──────────────────────────────────────────────────────────────
 
 class GatedFFN(nn.Module):
-    """SwiGLU 门控 FFN: gate(x) * up(x) → down"""
+    """SwiGLU gated FFN: gate(x) * up(x) → down"""
 
     def __init__(self, d_model, expand=4, dropout=0.1):
         super().__init__()
@@ -282,7 +282,7 @@ class GatedFFN(nn.Module):
 
 
 class AttentionPooling(nn.Module):
-    """注意力加权池化"""
+    """Attention-weighted pooling."""
 
     def __init__(self, d_model):
         super().__init__()
@@ -299,14 +299,14 @@ class AttentionPooling(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
-#  CNN Patch 嵌入 (将 [B, L, C] 压缩为 [B, L', D])
+#  CNN patch embedding (compresses [B, L, C] into [B, L', D])
 # ──────────────────────────────────────────────────────────────
 
 class Multi_Resolution_Data(nn.Module):
-    """多分辨率 patch embedding: 用不同 kernel_size/stride 的 Conv1d 下采样。
+    """Multi-resolution patch embedding: downsample with Conv1d using different kernel_size/stride values.
 
     Input:  [B, seq_len, enc_in]
-    Output: list of [B, L_i, d_model]  (每个分辨率一个)
+    Output: list of [B, L_i, d_model]  (one per resolution)
     """
 
     def __init__(self, enc_in, d_model, resolution_list, stride_list):
@@ -332,11 +332,11 @@ class Multi_Resolution_Data(nn.Module):
             x_list.append(out.permute(0, 2, 1))  # [B, L_i, d_model]
         return x_list
 # ──────────────────────────────────────────────────────────────
-#  1D 双向 Mamba 块 (操作 [B, L', D], K=2)
+#  1D bidirectional Mamba block (operates on [B, L', D], K=2)
 # ──────────────────────────────────────────────────────────────
 
 class BiMambaBlock(nn.Module):
-    """Mamba 块: K=2 双向 (forward + backward), K=1 单向 (forward only)。"""
+    """Mamba block: K=2 bidirectional (forward + backward), K=1 unidirectional (forward only)."""
 
     def __init__(self, d_model, d_state=16, d_conv=4, expand=2,
                  seq_len=125, dropout=0.1, drop_path=0.0, merge_mode="concat",
@@ -355,14 +355,14 @@ class BiMambaBlock(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────
-#  多尺度 CNN Patchify + 双向 Mamba 分类器
+#  Multi-scale CNN patchify + bidirectional Mamba classifier
 # ──────────────────────────────────────────────────────────────
 
 class ChannelMixing(nn.Module):
-    """轻量通道交互层: 对 EEG 通道维度做跨通道特征混合。
+    """Lightweight channel interaction layer: cross-channel feature mixing over the EEG channel dimension.
 
-    用 1x1 Conv (即 pointwise) 学习通道间空间关系,
-    如 "额区 vs 颞顶区" 的差异模式。
+    Uses 1x1 Conv (i.e. pointwise) to learn spatial relationships between channels,
+    e.g. differential patterns like "frontal vs. temporoparietal".
 
     Input:  [B, L, C]
     Output: [B, L, C]
@@ -381,15 +381,16 @@ class ChannelMixing(nn.Module):
         self.norm = nn.LayerNorm(n_channels)
 
     def forward(self, x):
-        # x: [B, L, C] — 残差连接
+        # x: [B, L, C] — residual connection
         return x + self.net(self.norm(x))
 
 
 class MultiScalePatchMambaClassifier(nn.Module):
-    """多尺度 CNN stem + 双向 Mamba (K=2) 分类器。
+    """Multi-scale CNN stem + bidirectional Mamba (K=2) classifier.
 
-    多路 CNN stem 以不同 stride 下采样，每路独立 BiMamba 扫描，
-    最后融合各尺度特征进行分类。
+    Multi-branch CNN stem downsamples with different strides; each branch is
+    scanned by an independent BiMamba, and features from all scales are fused
+    for classification.
 
     Input:  [B, seq_len, input_dim]  e.g. [B, 250, 12]
     Output: [B, num_classes]
@@ -407,15 +408,15 @@ class MultiScalePatchMambaClassifier(nn.Module):
         self.n_scales = len(patch_strides)
         actual_strides = patch_strides
 
-        # DropPath schedule (所有尺度共享)
+        # DropPath schedule (shared across scales)
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, n_layers)]
 
-        # ── 通道交互层 ──
+        # ── Channel interaction layer ──
         if use_channel_mix:
             cm_in = input_dim
             self.channel_mix = ChannelMixing(cm_in, expand=2, dropout=dropout)
 
-        # 多分辨率 patch embedding
+        # Multi-resolution patch embedding
         embed_in = input_dim
 
         self.multi_res_embed = Multi_Resolution_Data(
@@ -423,7 +424,7 @@ class MultiScalePatchMambaClassifier(nn.Module):
             resolution_list=list(patch_strides),
             stride_list=list(actual_strides))
 
-        # 每个尺度: pos embed + MH-BiMamba blocks + norm + pool
+        # Per-scale: pos embed + MH-BiMamba blocks + norm + pool
         self.pos_embeds = nn.ParameterList()
         self.scale_layers = nn.ModuleList()
         self.final_norms = nn.ModuleList()
@@ -454,7 +455,7 @@ class MultiScalePatchMambaClassifier(nn.Module):
 
         self.dropout_layer = nn.Dropout(dropout)
 
-        # 融合: concat 各尺度池化结果 → 投影回 d_model
+        # Fusion: concat pooled outputs from each scale → project back to d_model
         fusion_in = d_model * self.n_scales
         self.fusion = nn.Sequential(
             nn.LayerNorm(fusion_in),
@@ -468,20 +469,20 @@ class MultiScalePatchMambaClassifier(nn.Module):
         )
 
     def enable_visualization(self):
-        """启用 SSM 状态捕获 (仅用于可视化，会降低速度)。"""
+        """Enable SSM state capture (used for visualization only; slows down forward pass)."""
         for blocks in self.scale_layers:
             for mamba_block, *_ in blocks:
                 mamba_block.core.capture_states = True
 
     def disable_visualization(self):
-        """关闭 SSM 状态捕获，释放缓存。"""
+        """Disable SSM state capture and release cached states."""
         for blocks in self.scale_layers:
             for mamba_block, *_ in blocks:
                 mamba_block.core.capture_states = False
                 mamba_block.core._cached_states = None
 
     def get_ssm_states(self):
-        """收集所有层的 SSM 缓存状态。
+        """Collect cached SSM states from all layers.
 
         Returns: dict[scale_idx][layer_idx] → {delta, hidden_states, B, C}
         """
@@ -496,11 +497,11 @@ class MultiScalePatchMambaClassifier(nn.Module):
     def forward(self, x):
         # x: [B, L, C] = [B, 256, 19]
         x = self.channel_dropout(x)
-        # ── 通道交互 ──
+        # ── Channel interaction ──
         if self.use_channel_mix:
             x = self.channel_mix(x)                       # [B, L, 2C]
 
-        # ── 时间分支: 多尺度 BiMamba ──
+        # ── Temporal branch: multi-scale BiMamba ──
         multi_res_list = self.multi_res_embed(x)          # list of [B, Li, D]
 
         scale_feats = []
@@ -518,7 +519,7 @@ class MultiScalePatchMambaClassifier(nn.Module):
             h = self.pools[i](h)                          # [B, D]
             scale_feats.append(h)
 
-        # ── 融合 ──
+        # ── Fusion ──
         fused = self.fusion(torch.cat(scale_feats, dim=-1))                         # [B, D]
         logits = self.head(fused)                          # [B, num_classes]
         return logits, fused
